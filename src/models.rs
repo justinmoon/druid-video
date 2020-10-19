@@ -1,4 +1,6 @@
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+use druid::Data;
+
+#[derive(Data, Debug, Default, Clone, PartialEq, Eq)]
 pub struct Device {
     pub uri: String,
 }
@@ -69,36 +71,7 @@ impl std::fmt::Display for Control {
 pub type Representation = eye::control::Representation;
 pub type Value = eye::control::Value;
 
-use std::ops::{Deref, DerefMut};
-
-#[derive(Clone)]
-pub struct SendWrapper<T> {
-    inner: T,
-}
-
-impl<T> SendWrapper<T> {
-    pub unsafe fn new(val: T) -> Self {
-        SendWrapper { inner: val }
-    }
-}
-
-impl<T> Deref for SendWrapper<T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-
-impl<T> DerefMut for SendWrapper<T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.inner
-    }
-}
-
-unsafe impl<T> Send for SendWrapper<T> {}
-
-use std::{io, sync::mpsc};
+use std::sync::mpsc;
 
 #[derive(Debug, Clone)]
 pub struct Connection {
@@ -116,8 +89,10 @@ impl Connection {
         Connection { connection }
     }
 
-    pub fn start_stream(&self) {
-        self.connection.send(Request::StartStream).unwrap();
+    pub fn start_stream(&self, device: &Device) {
+        self.connection
+            .send(Request::StartStream(device.clone()))
+            .unwrap();
     }
 
     pub fn stop_stream(&self) {
@@ -151,23 +126,11 @@ impl Connection {
 
 #[derive(Debug)]
 pub enum Request {
-    StartStream,
+    StartStream(Device),
     StopStream,
     QueryFormats,
     QueryControls,
     GetFormat,
     SetFormat(Format),
     SetControl(Control),
-}
-
-// FIXME: I don't think this will get used. We'll have druid commands instead.
-#[derive(Debug)]
-pub enum Response {
-    StartStream(io::Result<()>),
-    StopStream(io::Result<()>),
-    QueryFormats(io::Result<Vec<Format>>),
-    QueryControls(io::Result<Vec<Control>>),
-    GetFormat(io::Result<Format>),
-    SetFormat(io::Result<Format>),
-    SetControl(io::Result<Control>),
 }

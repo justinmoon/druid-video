@@ -3,63 +3,50 @@ mod models;
 
 use std::{
     sync::{
-        mpsc::{channel, Receiver, Sender},
+        mpsc::{channel, Receiver},
         Arc,
     },
     thread,
 };
 
-use druid::widget::{Button, FillStrat, Flex, Image, ImageData, SizedBox};
+use druid::widget::{Button, Either, FillStrat, Flex, Image, ImageData, Label, List, SizedBox};
 use druid::{
     AppDelegate, AppLauncher, Command, Data, DelegateCtx, Env, ExtEventSink, Lens, LocalizedString,
     Selector, Target, Widget, WidgetExt, WindowDesc,
 };
 use eye::hal::traits::{Device as DeviceTrait, Stream};
-
 use eye::prelude::*;
 use ffimage::packed::dynamic::{ImageBuffer, ImageView};
 
-use crate::models::{Connection, Request, SendWrapper};
+use crate::models::{Connection, Device, Request};
 
 const IMAGE_DATA: Selector<ImageData> = Selector::new("IMAGE_DATA");
-const START: Selector<URI> = Selector::new("START");
-const STOP: Selector = Selector::new("STOP");
-
-struct URI(String);
+const START_STREAM: Selector<Device> = Selector::new("START_STREAM");
+const STOP_STREAM: Selector = Selector::new("STOP_STREAM");
 
 struct Delegate {}
 
 #[derive(Clone, Data, Lens)]
 struct AppState {
-    connection: Arc<models::Connection>,
+    connection: Arc<Connection>,
     buffer: Option<Arc<ImageData>>,
+    devices: Arc<Vec<Device>>,
+    streaming: bool,
 }
 
 impl AppState {
-    fn new(connection: models::Connection) -> Self {
+    fn new(connection: Connection, devices: Vec<Device>) -> Self {
         Self {
             buffer: None,
             connection: Arc::new(connection),
+            devices: Arc::new(devices),
+            streaming: false,
         }
     }
 }
-
-// Grab the first device
-fn get_uri() -> Option<URI> {
-    let devices: Vec<models::Device> = eye::device::Device::enumerate()
-        .iter()
-        .map(|dev| models::Device::from(dev.as_str()))
-        .collect();
-
-    if devices.len() > 0 {
-        return Some(URI(devices[0].uri.clone()));
-    }
-    return None;
-}
-
-fn open_device(uri: &URI) -> Box<dyn DeviceTrait> {
+fn open_device(uri: String) -> Box<dyn DeviceTrait> {
     // Grab the device
-    let mut device = eye::device::Device::with_uri(&uri.0).expect("with_uri() error");
+    let mut device = eye::device::Device::with_uri(&uri).expect("with_uri() error");
 
     // Set the format
     let mut format = device.format().expect("couldn't read format");
@@ -89,8 +76,8 @@ fn open_device(uri: &URI) -> Box<dyn DeviceTrait> {
 struct MyThread<'a> {
     sink: ExtEventSink,
     receiver: Receiver<Request>,
-    device: Option<SendWrapper<Box<dyn DeviceTrait>>>,
-    stream: Option<SendWrapper<Box<dyn 'a + for<'b> Stream<'b, Item = ImageView<'b>>>>>,
+    device: Option<Box<dyn DeviceTrait>>,
+    stream: Option<Box<dyn 'a + for<'b> Stream<'b, Item = ImageView<'b>>>>,
 }
 
 impl<'a> MyThread<'a> {
@@ -139,6 +126,15 @@ impl<'a> MyThread<'a> {
             // receive requests
             if let Ok(request) = self.receiver.recv_timeout(timeout) {
                 match request {
+                    Request::StartStream(device) => {
+                        let device = open_device(device.uri);
+                        self.stream = Some(device.stream().expect("stream() error"));
+                        self.device = Some(device);
+                    }
+                    Request::StopStream => {
+                        self.stream = None;
+                        self.device = None;
+                    }
                     _ => println!("ignored request"),
                 }
             }
@@ -156,7 +152,18 @@ impl AppDelegate<AppState> for Delegate {
         _env: &Env,
     ) -> bool {
         if let Some(image_data) = cmd.get(IMAGE_DATA) {
-            data.buffer = Some(Arc::new(image_data.clone()));
+            if data.streaming {
+                data.buffer = Some(Arc::new(image_data.clone()));
+            }
+        }
+        if let Some(device) = cmd.get(START_STREAM) {
+            data.connection.start_stream(device);
+            data.streaming = true;
+        }
+        if cmd.is(STOP_STREAM) {
+            data.streaming = false;
+            data.connection.stop_stream();
+            data.buffer = None;
         }
 
         // stop: remove current frame, send stop message to thread
@@ -178,14 +185,34 @@ fn ui_builder() -> impl Widget<AppState> {
 
         Some(component)
     });
-
-    let start = Button::new("Start").on_click(|_event, data: &mut AppState, _env| {
-        data.connection.start_stream();
-    });
-
     let wrapped_image = SizedBox::new(image).width(200.).height(200.);
 
-    Flex::column().with_child(wrapped_image).with_child(start)
+    let stop = Either::new(
+        |data: &AppState, _env| data.streaming,
+        Button::new("Stop").on_click(|ctx, _data: &mut AppState, _env| {
+            let cmd = Command::new(STOP_STREAM, ());
+            ctx.submit_command(cmd, None);
+        }),
+        Label::new(""),
+    );
+
+    let label = Label::new("Choose webcam:");
+
+    let device_list = List::new(|| {
+        Button::dynamic(|data: &Device, _env| data.uri.clone()).on_click(
+            |ctx, data: &mut Device, _env| {
+                let cmd = Command::new(START_STREAM, data.clone());
+                ctx.submit_command(cmd, None);
+            },
+        )
+    })
+    .lens(AppState::devices);
+
+    Flex::column()
+        .with_child(wrapped_image)
+        .with_child(label)
+        .with_child(device_list)
+        .with_child(stop)
 }
 fn main() {
     // Create app instance (we need an event sink)
@@ -200,8 +227,12 @@ fn main() {
     thread::spawn(move || MyThread::new(sink, receiver).run());
 
     // Launch app
-    let connection = models::Connection::new(sender);
-    let state = AppState::new(connection);
+    let connection = Connection::new(sender);
+    let devices: Vec<Device> = eye::device::Device::enumerate()
+        .iter()
+        .map(|dev| Device::from(dev.as_str()))
+        .collect();
+    let state = AppState::new(connection, devices);
     let delegate = Delegate {};
     app.delegate(delegate)
         .use_simple_logger()
