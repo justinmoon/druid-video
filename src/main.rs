@@ -16,13 +16,15 @@ use druid::{
 };
 use eye::hal::traits::{Device as DeviceTrait, Stream};
 use eye::prelude::*;
-use ffimage::packed::dynamic::{ImageBuffer, ImageView};
+use ffimage::packed::dynamic::{ImageBuffer as FFImageBuffer, ImageView};
+use image::DynamicImage;
 
 use crate::models::{Connection, Device, Request};
 
 const IMAGE_DATA: Selector<ImageData> = Selector::new("IMAGE_DATA");
 const START_STREAM: Selector<Device> = Selector::new("START_STREAM");
 const STOP_STREAM: Selector = Selector::new("STOP_STREAM");
+const QR_DECODED: Selector<String> = Selector::new("QR");
 
 struct Delegate {}
 
@@ -32,6 +34,7 @@ struct AppState {
     buffer: Option<Arc<ImageData>>,
     devices: Arc<Vec<Device>>,
     streaming: bool,
+    qr_data: Option<String>,
 }
 
 impl AppState {
@@ -41,6 +44,7 @@ impl AppState {
             connection: Arc::new(connection),
             devices: Arc::new(devices),
             streaming: false,
+            qr_data: None,
         }
     }
 }
@@ -59,28 +63,23 @@ fn open_device(uri: String) -> Box<dyn DeviceTrait> {
     return device;
 }
 
-//enum CamThread<'a> {
-//Idle {
-//sink: ExtEventSink,
-//receiver: Receiver<Request>,
-////device: SendWrapper<Box<dyn Device>>,
-//},
-//Streaming {
-//sink: ExtEventSink,
-//receiver: Receiver<Request>,
-//device: SendWrapper<Box<dyn DeviceTrait>>,
-//stream: SendWrapper<Box<dyn 'a + for<'b> Stream<'b, Item = ImageView<'b>>>>,
-//},
-//}
+fn decode_qr(img: &DynamicImage) -> Option<String> {
+    let decoder = bardecoder::default_decoder();
+    let results = decoder.decode(&img);
+    for result in results {
+        return result.ok();
+    }
+    None
+}
 
-struct MyThread<'a> {
+struct WebcamThread<'a> {
     sink: ExtEventSink,
     receiver: Receiver<Request>,
     device: Option<Box<dyn DeviceTrait>>,
     stream: Option<Box<dyn 'a + for<'b> Stream<'b, Item = ImageView<'b>>>>,
 }
 
-impl<'a> MyThread<'a> {
+impl<'a> WebcamThread<'a> {
     fn new(sink: ExtEventSink, receiver: Receiver<Request>) -> Self {
         Self {
             sink,
@@ -99,7 +98,7 @@ impl<'a> MyThread<'a> {
 
                 // Convert to druid's ImageData
                 // FIXME: can we reduce the amount of conversions here?
-                let ffi_image_buffer = ImageBuffer::from(&*image_view);
+                let ffi_image_buffer = FFImageBuffer::from(&*image_view);
                 let image_buffer: image::ImageBuffer<image::Bgra<u8>, Vec<u8>> =
                     image::ImageBuffer::from_raw(
                         ffi_image_buffer.width(),
@@ -107,10 +106,19 @@ impl<'a> MyThread<'a> {
                         ffi_image_buffer.raw().as_slice().unwrap().to_vec(),
                     )
                     .expect("Failed to convert ffimage::ImageBuffer to image::ImageBuffer");
-                let dynamic_image = image::DynamicImage::ImageBgra8(image_buffer);
-                let image_data = ImageData::from_dynamic_image_with_alpha(dynamic_image);
+                let dynamic_image = DynamicImage::ImageBgra8(image_buffer);
+
+                // Attempt to decode QR
+                match decode_qr(&dynamic_image) {
+                    Some(data) => self
+                        .sink
+                        .submit_command(QR_DECODED, data, None)
+                        .expect("couldn't submit command"),
+                    None => {}
+                };
 
                 // Send to render thread
+                let image_data = ImageData::from_dynamic_image_with_alpha(dynamic_image);
                 self.sink
                     .submit_command(IMAGE_DATA, image_data, None)
                     .expect("failed to submit command");
@@ -159,16 +167,19 @@ impl AppDelegate<AppState> for Delegate {
         if let Some(device) = cmd.get(START_STREAM) {
             data.connection.start_stream(device);
             data.streaming = true;
+            data.qr_data = None;
         }
         if cmd.is(STOP_STREAM) {
             data.streaming = false;
             data.connection.stop_stream();
             data.buffer = None;
         }
-
-        // stop: remove current frame, send stop message to thread
-
-        // start: send start message to thread
+        if let Some(qr_data) = cmd.get(QR_DECODED) {
+            data.streaming = false;
+            data.connection.stop_stream();
+            data.buffer = None;
+            data.qr_data = Some(qr_data.clone());
+        }
         true
     }
 }
@@ -196,6 +207,9 @@ fn ui_builder() -> impl Widget<AppState> {
         Label::new(""),
     );
 
+    let qr_data =
+        Label::dynamic(|data: &AppState, _env| data.qr_data.clone().unwrap_or("".to_string()));
+
     let label = Label::new("Choose webcam:");
 
     let device_list = List::new(|| {
@@ -210,6 +224,7 @@ fn ui_builder() -> impl Widget<AppState> {
 
     Flex::column()
         .with_child(wrapped_image)
+        .with_child(qr_data)
         .with_child(label)
         .with_child(device_list)
         .with_child(stop)
@@ -224,7 +239,7 @@ fn main() {
     let sink = app.get_external_handle();
     let (sender, receiver) = channel();
 
-    thread::spawn(move || MyThread::new(sink, receiver).run());
+    thread::spawn(move || WebcamThread::new(sink, receiver).run());
 
     // Launch app
     let connection = Connection::new(sender);
